@@ -1,4 +1,5 @@
 import math
+import random
 
 import numpy as np
 import torch
@@ -83,6 +84,7 @@ class ORT_NMS(torch.autograd.Function):
         zeros = torch.zeros((num_det,), dtype=torch.int64).to(device)
         selected_indices = torch.cat([batches[None], zeros[None], idxs[None]], 0).T.contiguous()
         selected_indices = selected_indices.to(torch.int64)
+
         return selected_indices
 
     @staticmethod
@@ -164,9 +166,10 @@ class ONNX_ORT(nn.Module):
         bboxes_w = x[..., 2:3]
         bboxes_h = x[..., 3:4]
         bboxes = torch.cat([bboxes_x, bboxes_y, bboxes_w, bboxes_h], dim = -1)
-        bboxes = bboxes.unsqueeze(2) # [n_batch, n_bboxes, 4] -> [n_batch, n_bboxes, 1, 4]
+        # bboxes = bboxes.unsqueeze(2) # [n_batch, n_bboxes, 4] -> [n_batch, n_bboxes, 1, 4]
         obj_conf = x[..., 4:]
         scores = obj_conf
+
         bboxes @= self.convert_matrix
         max_score, category_id = scores.max(2, keepdim=True)
         dis = category_id.float() * self.max_wh
@@ -178,6 +181,7 @@ class ONNX_ORT(nn.Module):
         selected_categories = category_id[X, Y, :].float()
         selected_scores = max_score[X, Y, :]
         X = X.unsqueeze(1).float()
+
         return torch.cat([X, selected_boxes, selected_categories, selected_scores], 1)
 
 

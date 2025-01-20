@@ -1,14 +1,15 @@
-python -m torch.distributed.launch --nproc_per_node 2 --master_port 9527 train.py \
+python -m torch.distributed.launch --nproc_per_node 2 --master_port 9999 train.py \
   --sync-bn \
   --workers 4 \
   --device 0,1 \
-  --batch 194 \
-  --data /home/tiennv/nvtien/projects/yolo-series/yolov9/datahub/small_coco/data.yaml \
+  --batch 256 \
+  --data datahub/small_coco/data.yaml \
   --img 640 \
   --cfg models/detect/yolov9-s-rtdetr.yaml \
   --weights 'weights/yolov9-s.pt' \
   --name "yolov9-s-rtdetr" \
-  --hyp /home/tiennv/nvtien/projects/yolo-series/yolov9/data/hyps/hyp.deyo.yaml \
+  --hyp data/hyps/hyp.deyo.yaml \
   --min-items 0 \
-  --epochs 20 \
-  --freeze 22
+  --epochs 96 \
+  --freeze 22 \
+  --optimizer AdamW

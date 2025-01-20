@@ -51,10 +51,10 @@ def save_one_json(predn, jdict, path, class_map):
 def prepare_batch(si, batch, device):
     """Prepares a batch of images and annotations for validation."""
     idx = batch["batch_idx"] == si
+    imgsz = batch["img"][si].shape[1:]
     cls = batch['cls'][batch["batch_idx"] == si]
     bbox = batch["bboxes"][idx]
     ori_shape = batch["ori_shape"]
-    imgsz = batch["img"].shape[2:]
     ratio_pad = batch["ratio_pad"]
     
     if len(cls):
@@ -62,47 +62,29 @@ def prepare_batch(si, batch, device):
         scale_boxes(imgsz, bbox, ori_shape, ratio_pad=ratio_pad)  # native-space labels
     return dict(cls=cls, bbox=bbox, ori_shape=ori_shape, imgsz=imgsz, ratio_pad=ratio_pad)
     
-def match_predictions(pred_classes, true_classes, iou, iouv, use_scipy=False):
+def process_batch(detections, labels, iouv):
     """
-    Matches predictions to ground truth objects (pred_classes, true_classes) using IoU.
-
-    Args:
-        pred_classes (torch.Tensor): Predicted class indices of shape(N,).
-        true_classes (torch.Tensor): Target class indices of shape(M,).
-        iou (torch.Tensor): An NxM tensor containing the pairwise IoU values for predictions and ground of truth
-        use_scipy (bool): Whether to use scipy for matching (more precise).
-
+    Return correct prediction matrix
+    Arguments:
+        detections (array[N, 6]), x1, y1, x2, y2, conf, class
+        labels (array[M, 5]), class, x1, y1, x2, y2
     Returns:
-        (torch.Tensor): Correct tensor of shape(N,10) for 10 IoU thresholds.
+        correct (array[N, 10]), for 10 IoU levels
     """
-    # Dx10 matrix, where D - detections, 10 - IoU thresholds
-    correct = np.zeros((pred_classes.shape[0], iouv.shape[0])).astype(bool)
-    # LxD matrix where L - labels (rows), D - detections (columns)
-    correct_class = true_classes[:, None] == pred_classes
-    iou = iou * correct_class  # zero out the wrong classes
-    iou = iou.cpu().numpy()
-    for i, threshold in enumerate(iouv.cpu().tolist()):
-        if use_scipy:
-            # WARNING: known issue that reduces mAP in https://github.com/ultralytics/ultralytics/pull/4708
-            import scipy  # scope import to avoid importing for all commands
-
-            cost_matrix = iou * (iou >= threshold)
-            if cost_matrix.any():
-                labels_idx, detections_idx = scipy.optimize.linear_sum_assignment(cost_matrix, maximize=True)
-                valid = cost_matrix[labels_idx, detections_idx] > 0
-                if valid.any():
-                    correct[detections_idx[valid], i] = True
-        else:
-            matches = np.nonzero(iou >= threshold)  # IoU > threshold and classes match
-            matches = np.array(matches).T
-            if matches.shape[0]:
-                if matches.shape[0] > 1:
-                    matches = matches[iou[matches[:, 0], matches[:, 1]].argsort()[::-1]]
-                    matches = matches[np.unique(matches[:, 1], return_index=True)[1]]
-                    # matches = matches[matches[:, 2].argsort()[::-1]]
-                    matches = matches[np.unique(matches[:, 0], return_index=True)[1]]
-                correct[matches[:, 1].astype(int), i] = True
-    return torch.tensor(correct, dtype=torch.bool, device=pred_classes.device)
+    correct = np.zeros((detections.shape[0], iouv.shape[0])).astype(bool)
+    iou = box_iou(labels[:, 1:], detections[:, :4])
+    correct_class = labels[:, 0:1] == detections[:, 5]
+    for i in range(len(iouv)):
+        x = torch.where((iou >= iouv[i]) & correct_class)  # IoU > threshold and classes match
+        if x[0].shape[0]:
+            matches = torch.cat((torch.stack(x, 1), iou[x[0], x[1]][:, None]), 1).cpu().numpy()  # [label, detect, iou]
+            if x[0].shape[0] > 1:
+                matches = matches[matches[:, 2].argsort()[::-1]]
+                matches = matches[np.unique(matches[:, 1], return_index=True)[1]]
+                # matches = matches[matches[:, 2].argsort()[::-1]]
+                matches = matches[np.unique(matches[:, 0], return_index=True)[1]]
+            correct[matches[:, 1].astype(int), i] = True
+    return torch.tensor(correct, dtype=torch.bool, device=iouv.device)
     
 @smart_inference_mode()
 def run(
@@ -168,7 +150,6 @@ def run(
     # Configure
     model.eval()
     cuda = device.type != 'cpu'
-    #is_coco = isinstance(data.get('val'), str) and data['val'].endswith(f'coco{os.sep}val2017.txt')  # COCO dataset
     is_coco = isinstance(data.get('val'), str) and data['val'].endswith(f'val2017.txt')  # COCO dataset
     nc = 1 if single_cls else int(data['nc'])  # number of classes
     iouv = torch.linspace(0.5, 0.95, 10, device=device)  # iou vector for mAP@0.5:0.95
@@ -203,9 +184,8 @@ def run(
     s = ('%22s' + '%11s' * 6) % ('Class', 'Images', 'Instances', 'P', 'R', 'mAP50', 'mAP50-95')
     tp, fp, p, r, f1, mp, mr, map50, ap50, map = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
     dt = Profile(), Profile(), Profile()  # profiling times
-    loss = torch.zeros(3, device=device)
+    mloss = torch.zeros(3, device=device)
     jdict, stats, ap, ap_class = [], [], [], []
-    stats = dict(tp=[], conf=[], pred_cls=[], target_cls=[])
     callbacks.run('on_val_start')
     pbar = tqdm(dataloader, desc=s, bar_format=TQDM_BAR_FORMAT)  # progress bar
     for batch_i, (im, targets, paths, shapes) in enumerate(pbar):
@@ -226,11 +206,10 @@ def run(
         batch_idx = targets[:, 0]
         gt_groups = [(batch_idx == i).sum().item() for i in range(bs)]
         _targets = {
-            "img":im,
-            "cls": targets[:,1].to(device, dtype=torch.long).view(-1),
+            "cls": targets[:,1].to(device, dtype=torch.long),
             "bboxes": targets[:,2:].to(device),
             "batch_idx": batch_idx.to(device, dtype=torch.long).view(-1),
-            "gt_groups": gt_groups,
+            "gt_groups": gt_groups
         }
         dec_bboxes, dec_scores, enc_bboxes, enc_scores, dn_meta = preds[1]
         
@@ -250,6 +229,7 @@ def run(
         loss, loss_items = sum(loss.values()), torch.as_tensor(
                         [loss[k].detach() for k in ["loss_giou", "loss_class", "loss_bbox"]], device=device
                     )
+        mloss = (mloss * batch_i + loss_items) / (batch_i + 1)  # update mean losses
         
         # Apply Filter bounding box
         bs, _, nd = preds[0].shape
@@ -272,51 +252,37 @@ def run(
             pred = pred[score.argsort(descending=True)]
             outputs[i] = pred  # [idx]
         preds = outputs
-        
+       
         # Metrics
         for si, pred in enumerate(preds):
-            path, shape = Path(paths[si]), shapes[si]
-            _targets['ori_shape'] = shapes[si][0]
-            _targets['ratio_pad'] = shapes[si][1]
+            labels = targets[targets[:, 0] == si, 1:]
+            nl, npr = labels.shape[0], pred.shape[0]  # number of labels, predictions
+            path, shape = Path(paths[si]), shapes[si][0]
+            correct = torch.zeros(npr, niou, dtype=torch.bool, device=device)  # init
             seen += 1
-            npr = len(pred)
-            stat = dict(
-                conf=torch.zeros(0, device=device),
-                pred_cls=torch.zeros(0, device=device),
-                tp=torch.zeros(npr, niou, dtype=torch.bool, device=device),
-            )
-            pbatch = prepare_batch(si, _targets, device)
             
-            cls, bbox = pbatch.pop("cls"), pbatch.pop("bbox")
-            nl = len(cls)
-            stat["target_cls"] = cls
             if npr == 0:
                 if nl:
-                    for k in stats.keys():
-                        stats[k].append(stat[k])
-                    # TODO: obb has not supported confusion_matrix yet.
+                    stats.append((correct, *torch.zeros((2, 0), device=device), labels[:, 0]))
                     if plots:
-                        confusion_matrix.process_batch(detections=None, gt_bboxes=bbox, gt_cls=cls)
+                        confusion_matrix.process_batch(detections=None, labels=labels[:, 0])
                 continue
 
             # Predictions
             if single_cls:
                 pred[:, 5] = 0
             predn = pred.clone()
-            scale_boxes(
-                pbatch["imgsz"], predn[:, :4], pbatch["ori_shape"], ratio_pad=pbatch["ratio_pad"]
-            ) # native-space pred
-            predn = predn.float()
-            stat["conf"] = predn[:, 4]
-            stat["pred_cls"] = predn[:, 5]
+            scale_boxes(im[si].shape[1:], predn[:, :4], shape, shapes[si][1])  # native-space pred
             
             # Evaluate
             if nl:
-                iou = box_iou(bbox, predn[:, :4])
-                stat['tp'] = match_predictions(predn[:, 5], cls, iou, iouv)
-
-            for k in stats.keys():
-                stats[k].append(stat[k])
+                tbox = xywh2xyxy(labels[:, 1:5])  # target boxes
+                scale_boxes(im[si].shape[1:], tbox, shape, shapes[si][1])  # native-space labels
+                labelsn = torch.cat((labels[:, 0:1], tbox), 1)  # native-space labels
+                correct = process_batch(predn, labelsn, iouv)
+                if plots:
+                    confusion_matrix.process_batch(predn, labelsn)
+            stats.append((correct, pred[:, 4], pred[:, 5], labels[:, 0]))  # (correct, conf, pcls, tcls)
             
             # Save/log
             if save_txt:
@@ -333,17 +299,18 @@ def run(
         callbacks.run('on_val_batch_end', batch_i, im, targets, paths, shapes, preds)
 
     # Compute metrics
-    stats = {k: torch.cat(v, 0).cpu().numpy() for k, v in stats.items()}  # to numpy
-    
-    if len(stats) and stats["tp"].any():
+    stats = [torch.cat(x, 0).cpu().numpy() for x in zip(*stats)]  # to numpy
+    if len(stats) and stats[0].any():
         tp, fp, p, r, f1, ap, ap_class = ap_per_class(**stats, plot=plots, save_dir=save_dir, names=names)
         ap50, ap = ap[:, 0], ap.mean(1)  # AP@0.5, AP@0.5:0.95
         mp, mr, map50, map = p.mean(), r.mean(), ap50.mean(), ap.mean()
-    nt = np.bincount(stats['target_cls'].astype(int), minlength=nc)  # number of targets per class
+    nt = np.bincount(stats[3].astype(int), minlength=nc)  # number of targets per class
 
     # Print results
     pf = '%22s' + '%11i' * 2 + '%11.3g' * 4  # print format
+    pf_loss = '%22s' + '%11.3g' * 3 # print format
     LOGGER.info(pf % ('all', seen, nt.sum(), mp, mr, map50, map))
+    LOGGER.info(pf_loss % ('val/loss', *(mloss.cpu() / len(dataloader)).tolist()))
     if nt.sum() == 0:
         LOGGER.warning(f'WARNING ⚠️ no labels found in {task} set, can not compute metrics without labels')
 
@@ -397,8 +364,7 @@ def run(
     maps = np.zeros(nc) + map
     for i, c in enumerate(ap_class):
         maps[c] = ap[i]
-        
-    return (mp, mr, map50, map, *(loss_items.cpu() / len(dataloader)).tolist()), maps, t
+    return (mp, mr, map50, map, *(mloss.cpu() / len(dataloader)).tolist()), maps, t
 
 
 def parse_opt():

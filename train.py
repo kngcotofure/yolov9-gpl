@@ -10,6 +10,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+
 import torch.distributed as dist
 import torch.nn as nn
 import yaml
@@ -23,6 +24,7 @@ if str(ROOT) not in sys.path:
 ROOT = Path(os.path.relpath(ROOT, Path.cwd()))  # relative
 
 import val as validate  # for end-of-epoch mAP
+import val_detr as validate_detr
 from models.experimental import attempt_load
 from models.yolo import Model
 from utils.autoanchor import check_anchors
@@ -37,6 +39,7 @@ from utils.general import (LOGGER, TQDM_BAR_FORMAT, check_amp, check_dataset, ch
 from utils.loggers import Loggers
 from utils.loggers.comet.comet_utils import check_comet_resume
 from utils.loss_tal import ComputeLoss
+from utils.loss_rtdetr import RTDETRDetectionLoss
 from utils.metrics import fitness
 from utils.plots import plot_evolve
 from utils.torch_utils import (EarlyStopping, ModelEMA, de_parallel, select_device, smart_DDP,
@@ -53,7 +56,8 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
         Path(opt.save_dir), opt.epochs, opt.batch_size, opt.weights, opt.single_cls, opt.evolve, opt.data, opt.cfg, \
         opt.resume, opt.noval, opt.nosave, opt.workers, opt.freeze
     callbacks.run('on_pretrain_routine_start')
-
+    detr = True if "rtdetr" in opt.cfg else False
+    
     # Directories
     w = save_dir / 'weights'  # weights dir
     (w.parent if evolve else w).mkdir(parents=True, exist_ok=True)  # make dir
@@ -190,7 +194,8 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                                               quad=opt.quad,
                                               prefix=colorstr('train: '),
                                               shuffle=True,
-                                              min_items=opt.min_items)
+                                              min_items=opt.min_items,
+                                            )
     labels = np.concatenate(dataset.labels, 0)
     mlc = int(labels[:, 0].max())  # max label class
     assert mlc < nc, f'Label class {mlc} exceeds nc={nc} in {data}. Possible class labels are 0-{nc - 1}'
@@ -243,7 +248,13 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
     scheduler.last_epoch = start_epoch - 1  # do not move
     scaler = torch.cuda.amp.GradScaler(enabled=amp)
     stopper, stop = EarlyStopping(patience=opt.patience), False
-    compute_loss = ComputeLoss(model)  # init loss class
+    if detr:
+        compute_loss = RTDETRDetectionLoss(nc, use_vfl=True) 
+        validate_fn = validate_detr
+    else:
+        compute_loss = ComputeLoss(model)  # init loss class
+        validate_fn = validate
+        
     callbacks.run('on_train_start')
     LOGGER.info(f'Image sizes {imgsz} train, {imgsz} val\n'
                 f'Using {train_loader.num_workers * WORLD_SIZE} dataloader workers\n'
@@ -252,6 +263,7 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
     for epoch in range(start_epoch, epochs):  # epoch ------------------------------------------------------------------
         callbacks.run('on_train_epoch_start')
         model.train()
+        torch.use_deterministic_algorithms(False)
 
         # Update image weights (optional, single-GPU only)
         if opt.image_weights:
@@ -301,7 +313,37 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
             # Forward
             with torch.cuda.amp.autocast(amp):
                 pred = model(imgs)  # forward
-                loss, loss_items = compute_loss(pred, targets.to(device))  # loss scaled by batch_size
+                
+                if detr:
+                    bs = len(imgs)
+                    batch_idx = targets[:, 0]
+                    gt_groups = [(batch_idx == i).sum().item() for i in range(bs)]
+                    _targets = {
+                        "cls": targets[:,1].to(device, dtype=torch.long),
+                        "bboxes": targets[:,2:].to(device),
+                        "batch_idx": batch_idx.to(device, dtype=torch.long).view(-1),
+                        "gt_groups": gt_groups,
+                    }
+                    dec_bboxes, dec_scores, enc_bboxes, enc_scores, dn_meta = pred
+                    if dn_meta is None:
+                        dn_bboxes, dn_scores = None, None
+                    else:
+                        dn_bboxes, dec_bboxes = torch.split(dec_bboxes, dn_meta["dn_num_split"], dim=2)
+                        dn_scores, dec_scores = torch.split(dec_scores, dn_meta["dn_num_split"], dim=2)
+
+                    dec_bboxes = torch.cat([enc_bboxes.unsqueeze(0), dec_bboxes])  # (7, bs, 300, 4)
+                    dec_scores = torch.cat([enc_scores.unsqueeze(0), dec_scores])
+                    
+                    loss = compute_loss((dec_bboxes, dec_scores), _targets, 
+                                        dn_bboxes=dn_bboxes, dn_scores=dn_scores, 
+                                        dn_meta=dn_meta
+                                    )
+                    loss, loss_items = sum(loss.values()), torch.as_tensor(
+                        [loss[k].detach() for k in ["loss_giou", "loss_class", "loss_bbox"]], device=device
+                    )
+                else:
+                    loss, loss_items = compute_loss(pred, targets.to(device))  # loss scaled by batch_size
+                
                 if RANK != -1:
                     loss *= WORLD_SIZE  # gradient averaged between devices in DDP mode
                 if opt.quad:
@@ -342,7 +384,7 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
             ema.update_attr(model, include=['yaml', 'nc', 'hyp', 'names', 'stride', 'class_weights'])
             final_epoch = (epoch + 1 == epochs) or stopper.possible_stop
             if not noval or final_epoch:  # Calculate mAP
-                results, maps, _ = validate.run(data_dict,
+                results, maps, _ = validate_fn.run(data_dict,
                                                 batch_size=batch_size // WORLD_SIZE * 2,
                                                 imgsz=imgsz,
                                                 half=amp,
@@ -405,7 +447,7 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                     strip_optimizer(f, best_striped)  # strip optimizers
                 if f is best:
                     LOGGER.info(f'\nValidating {f}...')
-                    results, _, _ = validate.run(
+                    results, _, _ = validate_fn.run(
                         data_dict,
                         batch_size=batch_size // WORLD_SIZE * 2,
                         imgsz=imgsz,
@@ -466,7 +508,7 @@ def parse_opt(known=False):
     parser.add_argument('--freeze', nargs='+', type=int, default=[0], help='Freeze layers: backbone=10, first3=0 1 2')
     parser.add_argument('--save-period', type=int, default=-1, help='Save checkpoint every x epochs (disabled if < 1)')
     parser.add_argument('--seed', type=int, default=0, help='Global training seed')
-    parser.add_argument('--local_rank', type=int, default=-1, help='Automatic DDP Multi-GPU argument, do not modify')
+    parser.add_argument('--local_rank', '--local-rank', type=int, default=-1, help='Automatic DDP Multi-GPU argument, do not modify')
     parser.add_argument('--min-items', type=int, default=0, help='Experimental')
     parser.add_argument('--close-mosaic', type=int, default=0, help='Experimental')
 

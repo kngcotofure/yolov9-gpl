@@ -172,9 +172,8 @@ class RTDETRDecoder(Detect):
 
         self._reset_parameters()
         
-    def forward(self, x, batch=None):
+    def forward(self, x, batch=None, imgsz=None):
         """Runs the forward pass of the module, returning bounding box and classification scores for the input."""
-        imgsz = x[0].shape[2:]  # BCHW
         # Input projection and embedding
         feats, shapes = self._get_encoder_input(x)
         
@@ -191,7 +190,7 @@ class RTDETRDecoder(Detect):
             self.num_denoising,
             self.label_noise_ratio,
             self.box_noise_scale,
-            False, #self.training,
+            False, # self.training, # get NaN when use self.training
         )
 
         embed, refer_bbox, enc_bboxes, enc_scores = self._get_decoder_input(feats, dbox, dn_embed, dn_bbox)
@@ -753,8 +752,9 @@ class BaseModel(nn.Module):
     def forward(self, x, profile=False, visualize=False, detr=False):
         return self._forward_once(x, profile, visualize, detr)  # single-scale inference, train
 
-    def _forward_once(self, x, profile=False, visualize=False, detr=False):            
+    def _forward_once(self, x, batch=None, profile=False, visualize=False, detr=False):            
         y, dt = [], []  # outputs
+        imgz = x.shape[2:]
         for m in self.model[:-1]:
             if m.f != -1:  # if not from previous layer
                 x = y[m.f] if isinstance(m.f, int) else [x if j == -1 else y[j] for j in m.f]  # from earlier layers
@@ -767,7 +767,7 @@ class BaseModel(nn.Module):
         
         head = self.model[-1]
         if detr:
-            return head([y[j] for j in head.f], batch=None)
+            return head([y[j] for j in head.f], batch=batch, imgsz=imgz)
             
         return head([y[j] for j in head.f])
 
@@ -866,10 +866,10 @@ class DetectionModel(BaseModel):
         self.info()
         LOGGER.info('')
 
-    def forward(self, x, augment=False, profile=False, visualize=False, detr=False):
+    def forward(self, x, batch=None, augment=False, profile=False, visualize=False, detr=False):
         if augment:
             return self._forward_augment(x)  # augmented inference, None
-        return self._forward_once(x, profile, visualize, detr)  # single-scale inference, train
+        return self._forward_once(x, batch, profile, visualize, detr)  # single-scale inference, train
 
     def _forward_augment(self, x):
         img_size = x.shape[-2:]  # height, width

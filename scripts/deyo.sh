@@ -2,14 +2,14 @@ python -m torch.distributed.launch --nproc_per_node 2 --master_port 9999 train.p
   --sync-bn \
   --workers 4 \
   --device 0,1 \
-  --batch 256 \
+  --batch 96 \
   --data datahub/small_coco/data.yaml \
   --img 640 \
-  --cfg models/detect/yolov9-s-rtdetr.yaml \
-  --weights 'weights/yolov9-s.pt' \
-  --name "yolov9-s-rtdetr" \
+  --cfg models/detect/yolov9-c-rtdetr.yaml \
+  --weights 'weights/yolov9-c.pt' \
+  --name "yolov9-c-rtdetr" \
   --hyp data/hyps/hyp.deyo.yaml \
-  --min-items 0 \
-  --epochs 96 \
-  --freeze 22 \
+  --epochs 300 \
+  --close-mosaic 15 \
+  --freeze 23 \
   --optimizer AdamW

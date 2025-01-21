@@ -312,8 +312,6 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
 
             # Forward
             with torch.cuda.amp.autocast(amp):
-                pred = model(imgs)  # forward
-                
                 if detr:
                     bs = len(imgs)
                     batch_idx = targets[:, 0]
@@ -324,6 +322,9 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                         "batch_idx": batch_idx.to(device, dtype=torch.long).view(-1),
                         "gt_groups": gt_groups,
                     }
+                pred = model(imgs, batch=_targets, detr=detr)  # forward
+                
+                if detr:
                     dec_bboxes, dec_scores, enc_bboxes, enc_scores, dn_meta = pred
                     if dn_meta is None:
                         dn_bboxes, dn_scores = None, None
@@ -333,7 +334,7 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
 
                     dec_bboxes = torch.cat([enc_bboxes.unsqueeze(0), dec_bboxes])  # (7, bs, 300, 4)
                     dec_scores = torch.cat([enc_scores.unsqueeze(0), dec_scores])
-                    
+   
                     loss = compute_loss((dec_bboxes, dec_scores), _targets, 
                                         dn_bboxes=dn_bboxes, dn_scores=dn_scores, 
                                         dn_meta=dn_meta

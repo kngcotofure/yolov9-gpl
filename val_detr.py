@@ -199,9 +199,6 @@ def run(
             nb, _, height, width = im.shape  # batch size, channels, height, width
 
         # Inference
-        with dt[1]:
-            preds = model(im)  # forward
-        
         bs = len(im)
         batch_idx = targets[:, 0]
         gt_groups = [(batch_idx == i).sum().item() for i in range(bs)]
@@ -211,6 +208,10 @@ def run(
             "batch_idx": batch_idx.to(device, dtype=torch.long).view(-1),
             "gt_groups": gt_groups
         }
+        
+        with dt[1]:
+            preds = model(im, batch=_targets, detr=True)  # forward
+ 
         dec_bboxes, dec_scores, enc_bboxes, enc_scores, dn_meta = preds[1]
         
         if dn_meta is None:
@@ -238,13 +239,14 @@ def run(
         outputs = [torch.zeros((0, 6), device=bboxes.device)] * bs
         topk_values, topk_indexes = torch.topk(scores.reshape(scores.shape[0], -1), max_det, dim=1)
         topk_boxes = topk_indexes // scores.shape[2]
-        labels = topk_indexes % scores.shape[2]
+        lbs = topk_indexes % scores.shape[2]
         bboxes = torch.gather(bboxes, 1, topk_boxes.unsqueeze(-1).repeat(1,1,4))
         scores = topk_values
+        
         for i, bbox in enumerate(bboxes):  # (300, 4)
             bbox = xywh2xyxy(bbox)
             score = scores[i]
-            cls = labels[i]
+            cls = lbs[i]
             # Do not need threshold for evaluation as only got 300 boxes here
             # idx = score > self.args.conf
             pred = torch.cat([bbox, score[..., None], cls[..., None]], dim=-1)  # filter
@@ -273,10 +275,9 @@ def run(
                 pred[:, 5] = 0
             predn = pred.clone()
             scale_boxes(im[si].shape[1:], predn[:, :4], shape, shapes[si][1])  # native-space pred
-            
             # Evaluate
             if nl:
-                tbox = xywh2xyxy(labels[:, 1:5])  # target boxes
+                tbox = xywh2xyxy(labels[:, 1:5])  * torch.tensor(im[si].shape[1:], device=device)[[1, 0, 1, 0]]  # target boxes # target boxes
                 scale_boxes(im[si].shape[1:], tbox, shape, shapes[si][1])  # native-space labels
                 labelsn = torch.cat((labels[:, 0:1], tbox), 1)  # native-space labels
                 correct = process_batch(predn, labelsn, iouv)
@@ -301,7 +302,7 @@ def run(
     # Compute metrics
     stats = [torch.cat(x, 0).cpu().numpy() for x in zip(*stats)]  # to numpy
     if len(stats) and stats[0].any():
-        tp, fp, p, r, f1, ap, ap_class = ap_per_class(**stats, plot=plots, save_dir=save_dir, names=names)
+        tp, fp, p, r, f1, ap, ap_class = ap_per_class(*stats, plot=plots, save_dir=save_dir, names=names)
         ap50, ap = ap[:, 0], ap.mean(1)  # AP@0.5, AP@0.5:0.95
         mp, mr, map50, map = p.mean(), r.mean(), ap50.mean(), ap.mean()
     nt = np.bincount(stats[3].astype(int), minlength=nc)  # number of targets per class

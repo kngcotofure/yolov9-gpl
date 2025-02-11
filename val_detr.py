@@ -161,7 +161,7 @@ def run(
             ncm = model.model.nc
             assert ncm == nc, f'{weights} ({ncm} classes) trained on different --data than what you passed ({nc} ' \
                               f'classes). Pass correct combination of --weights and --data that are trained together.'
-        model.warmup(imgsz=(1 if pt else batch_size, 3, imgsz, imgsz))  # warmup
+        model.warmup(imgsz=(1 if pt else batch_size, 3, imgsz, imgsz), detr=True)  # warmup
         pad, rect = (0.0, False) if task == 'speed' else (0.5, pt)  # square inference for benchmarks
         task = task if task in ('train', 'val', 'test') else 'val'  # path to train/val/test images
         dataloader = create_dataloader(data[task],
@@ -198,7 +198,7 @@ def run(
             im /= 255  # 0 - 255 to 0.0 - 1.0
             nb, _, height, width = im.shape  # batch size, channels, height, width
 
-        # Inference
+        # Inferclaence
         bs = len(im)
         batch_idx = targets[:, 0]
         gt_groups = [(batch_idx == i).sum().item() for i in range(bs)]
@@ -211,26 +211,27 @@ def run(
         
         with dt[1]:
             preds = model(im, batch=_targets, detr=True)  # forward
- 
-        dec_bboxes, dec_scores, enc_bboxes, enc_scores, dn_meta = preds[1]
         
-        if dn_meta is None:
-            dn_bboxes, dn_scores = None, None
-        else:
-            dn_bboxes, dec_bboxes = torch.split(dec_bboxes, dn_meta["dn_num_split"], dim=2)
-            dn_scores, dec_scores = torch.split(dec_scores, dn_meta["dn_num_split"], dim=2)
+            if compute_loss:
+                dec_bboxes, dec_scores, enc_bboxes, enc_scores, dn_meta = preds[1]
+            
+            if dn_meta is None:
+                dn_bboxes, dn_scores = None, None
+            else:
+                dn_bboxes, dec_bboxes = torch.split(dec_bboxes, dn_meta["dn_num_split"], dim=2)
+                dn_scores, dec_scores = torch.split(dec_scores, dn_meta["dn_num_split"], dim=2)
 
-        dec_bboxes = torch.cat([enc_bboxes.unsqueeze(0), dec_bboxes])  # (7, bs, 300, 4)
-        dec_scores = torch.cat([enc_scores.unsqueeze(0), dec_scores])
-        
-        loss = compute_loss((dec_bboxes, dec_scores), _targets, 
-                            dn_bboxes=dn_bboxes, dn_scores=dn_scores, 
-                            dn_meta=dn_meta
+            dec_bboxes = torch.cat([enc_bboxes.unsqueeze(0), dec_bboxes])  # (7, bs, 300, 4)
+            dec_scores = torch.cat([enc_scores.unsqueeze(0), dec_scores])
+
+            loss = compute_loss((dec_bboxes, dec_scores), _targets, 
+                                dn_bboxes=dn_bboxes, dn_scores=dn_scores, 
+                                dn_meta=dn_meta
+                            )
+            loss, loss_items = sum(loss.values()), torch.as_tensor(
+                            [loss[k].detach() for k in ["loss_giou", "loss_class", "loss_bbox"]], device=device
                         )
-        loss, loss_items = sum(loss.values()), torch.as_tensor(
-                        [loss[k].detach() for k in ["loss_giou", "loss_class", "loss_bbox"]], device=device
-                    )
-        mloss = (mloss * batch_i + loss_items) / (batch_i + 1)  # update mean losses
+            mloss = (mloss * batch_i + loss_items) / (batch_i + 1)  # update mean losses
         
         # Apply Filter bounding box
         bs, _, nd = preds[0].shape
@@ -333,7 +334,7 @@ def run(
 
     # Save JSON
     if save_json and len(jdict):
-        w = Path(weights[0] if isinstance(weights, list) else weights).stem if weights is not None else ''  # weights
+        w = Path(weights[0] if isinstance(weights, list) else weights).stem if weights is not None else ''  # 
         anno_json = str(Path(data.get('path', '../coco')) / 'annotations/instances_val2017.json')  # annotations json
         pred_json = str(save_dir / f"{w}_predictions.json")  # predictions json
         LOGGER.info(f'\nEvaluating pycocotools mAP... saving {pred_json}...')

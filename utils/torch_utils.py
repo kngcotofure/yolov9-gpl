@@ -4,6 +4,7 @@ import platform
 import subprocess
 import time
 import warnings
+import pickle
 from contextlib import contextmanager
 from copy import deepcopy
 from pathlib import Path
@@ -527,3 +528,19 @@ class ModelEMA:
     def update_attr(self, model, include=(), exclude=('process_group', 'reducer')):
         # Update EMA attributes
         copy_attr(self.ema, model, include, exclude)
+
+
+class CustomUnpickler(pickle.Unpickler):
+    def __init__(self, *args, map_location='cpu', **kwargs):
+        self._map_location = map_location
+        super().__init__(*args, **kwargs)
+    
+    def find_class(self, mod_name, name):
+        renamed_module = mod_name.replace('multitasks.','')\
+                                        .replace('yolov9.','') \
+                                        .replace(r'\.','.')
+        
+        return super(CustomUnpickler, self).find_class(renamed_module, name)
+    
+class CustomPickle:
+    Unpickler = CustomUnpickler

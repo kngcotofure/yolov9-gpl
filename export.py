@@ -85,7 +85,7 @@ def export_torchscript(model, im, file, optimize, prefix=colorstr('TorchScript:'
 
 
 @try_export
-def export_onnx(model, im, file, opset, dynamic, simplify, prefix=colorstr('ONNX:')):
+def export_onnx(model, im, file, opset, dynamic, simplify, cleanup=True, prefix=colorstr('ONNX:')):
     # YOLO ONNX export
     check_requirements('onnx')
     import onnx
@@ -95,12 +95,13 @@ def export_onnx(model, im, file, opset, dynamic, simplify, prefix=colorstr('ONNX
 
     output_names = ['output0', 'output1'] if isinstance(model, SegmentationModel) else ['output0']
     if dynamic:
-        dynamic = {'images': {0: 'batch', 2: 'height', 3: 'width'}}  # shape(1,3,640,640)
+        # dynamic = {'images': {0: 'batch', 2: 'height', 3: 'width'}}  # shape(1,3,640,640)
+        dynamic = {'images': {0: 'batch'}}  # shape(1,3,640,640)
         if isinstance(model, SegmentationModel):
             dynamic['output0'] = {0: 'batch', 1: 'anchors'}  # shape(1,25200,85)
             dynamic['output1'] = {0: 'batch', 2: 'mask_height', 3: 'mask_width'}  # shape(1,32,160,160)
         elif isinstance(model, DetectionModel):
-            dynamic['output0'] = {0: 'batch', 1: 'anchors'}  # shape(1,25200,85)
+            dynamic['output0'] = {0: 'batch', 1: 'anchors'}  # shape(1,25200,85) | shape(1, 300, 85)
 
     torch.onnx.export(
         model.cpu() if dynamic else model,  # --dynamic only compatible with cpu
@@ -137,6 +138,31 @@ def export_onnx(model, im, file, opset, dynamic, simplify, prefix=colorstr('ONNX
             onnx.save(model_onnx, f)
         except Exception as e:
             LOGGER.info(f'{prefix} simplifier failure: {e}')
+    
+    # cleanup
+    if cleanup:
+        try:
+            import importlib.util
+
+            # Check if package is installed
+            if importlib.util.find_spec("onnx_graphsurgeon") is None:
+                os.system("pip install onnx_graphsurgeon")
+
+            import onnx_graphsurgeon as gs
+
+            print("\nStarting to cleanup ONNX using onnx_graphsurgeon...")
+            graph = gs.import_onnx(model_onnx)
+            graph = graph.cleanup().toposort()
+            model_onnx = gs.export_onnx(graph)
+        except Exception as e:
+            print(f"Cleanup failure: {e}")
+
+    # print(onnx.helper.printable_graph(onnx_model.graph))  # print a human readable model
+    inputs = [node for node in model_onnx.graph.input]
+    print("Inputs: ", inputs, "\n")
+    outputs = [node for node in model_onnx.graph.output]
+    print("Outputs: ", outputs)
+    
     return f, model_onnx
 
 
@@ -536,7 +562,8 @@ def run(
         topk_per_class=100,  # TF.js NMS: topk per class to keep
         topk_all=100,  # TF.js NMS: topk for all classes to keep
         iou_thres=0.45,  # TF.js NMS: IoU threshold
-        conf_thres=0.25,  # TF.js NMS: confidence threshold
+        conf_thres=0.25,  # TF.js NMS: confidence threshold,
+        detr=False # DEYO export
 ):
     t = time.time()
     include = [x.lower() for x in include]  # to lowercase
@@ -570,9 +597,8 @@ def run(
             m.inplace = inplace
             m.dynamic = dynamic
             m.export = True
-
     for _ in range(2):
-        y = model(im)  # dry runs
+        y = model(im, detr=detr)  # dry runs
     if half and not coreml:
         im, model = im.half(), model.half()  # to FP16
     shape = tuple((y[0] if isinstance(y, (tuple, list)) else y).shape)  # model output shape
@@ -675,6 +701,7 @@ def parse_opt():
         nargs='+',
         default=['torchscript'],
         help='torchscript, onnx, onnx_end2end, openvino, engine, coreml, saved_model, pb, tflite, edgetpu, tfjs, paddle')
+    parser.add_argument('--detr', action='store_true', help='DEYO export')
     opt = parser.parse_args()
 
     if 'onnx_end2end' in opt.include:

@@ -749,10 +749,10 @@ class Panoptic(Detect):
 
 class BaseModel(nn.Module):
     # YOLO base model
-    def forward(self, x, profile=False, visualize=False, detr=False):
+    def forward(self, x, profile=False, visualize=False, detr=True):
         return self._forward_once(x, profile, visualize, detr)  # single-scale inference, train
 
-    def _forward_once(self, x, batch=None, profile=False, visualize=False, detr=False):            
+    def _forward_once(self, x, batch=None, profile=False, visualize=False, detr=True):            
         y, dt = [], []  # outputs
         imgz = x.shape[2:]
         for m in self.model[:-1]:
@@ -866,7 +866,7 @@ class DetectionModel(BaseModel):
         self.info()
         LOGGER.info('')
 
-    def forward(self, x, batch=None, augment=False, profile=False, visualize=False, detr=False):
+    def forward(self, x, batch=None, augment=False, profile=False, visualize=False, detr=True):
         if augment:
             return self._forward_augment(x)  # augmented inference, None
         return self._forward_once(x, batch, profile, visualize, detr)  # single-scale inference, train

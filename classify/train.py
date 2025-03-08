@@ -107,7 +107,9 @@ def train(opt, device):
 
     # Model
     with torch_distributed_zero_first(LOCAL_RANK), WorkingDirectory(ROOT):
-        if Path(opt.model).is_file() or opt.model.endswith('.pt'):
+        if Path(opt.model).is_file() and opt.model.endswith('.yaml'):
+            model = ClassificationModel(cfg=opt.model, nc=nc).to(device)  # create
+        elif Path(opt.model).is_file() and opt.model.endswith('.pt'):
             model = attempt_load(opt.model, device='cpu', fuse=False)
         elif opt.model in torchvision.models.__dict__:  # TorchVision models i.e. resnet50, efficientnet_b0
             model = torchvision.models.__dict__[opt.model](weights='IMAGENET1K_V1' if pretrained else None)
@@ -130,12 +132,13 @@ def train(opt, device):
     # Info
     if RANK in {-1, 0}:
         model.names = trainloader.dataset.classes  # attach class names
+        names = [str(i) for i in model.names]
         model.transforms = testloader.dataset.torch_transforms  # attach inference transforms
         model_info(model)
         if opt.verbose:
             LOGGER.info(model)
         images, labels = next(iter(trainloader))
-        file = imshow_cls(images[:25], labels[:25], names=model.names, f=save_dir / 'train_images.jpg')
+        file = imshow_cls(images[:25], labels[:25], names=names, f=save_dir / 'train_images.jpg')
         logger.log_images(file, name='Train Examples')
         logger.log_graph(model, imgsz)  # log model
 
@@ -260,7 +263,7 @@ def train(opt, device):
         # Plot examples
         images, labels = (x[:25] for x in next(iter(testloader)))  # first 25 images and labels
         pred = torch.max(ema.ema(images.to(device)), 1)[1]
-        file = imshow_cls(images, labels, pred, model.names, verbose=False, f=save_dir / 'test_images.jpg')
+        file = imshow_cls(images, labels, pred, names, verbose=False, f=save_dir / 'test_images.jpg')
 
         # Log results
         meta = {"epochs": epochs, "top1_acc": best_fitness, "date": datetime.now().isoformat()}
@@ -291,7 +294,7 @@ def parse_opt(known=False):
     parser.add_argument('--dropout', type=float, default=None, help='Dropout (fraction)')
     parser.add_argument('--verbose', action='store_true', help='Verbose mode')
     parser.add_argument('--seed', type=int, default=0, help='Global training seed')
-    parser.add_argument('--local_rank', type=int, default=-1, help='Automatic DDP Multi-GPU argument, do not modify')
+    parser.add_argument('--local_rank', '--local-rank', type=int, default=-1, help='Automatic DDP Multi-GPU argument, do not modify')
     return parser.parse_known_args()[0] if known else parser.parse_args()
 
 

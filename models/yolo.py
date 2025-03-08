@@ -688,7 +688,7 @@ class ClassificationModel(BaseModel):
     # YOLO classification model
     def __init__(self, cfg=None, model=None, nc=1000, cutoff=10):  # yaml, model, number of classes, cutoff index
         super().__init__()
-        self._from_detection_model(model, nc, cutoff) if model is not None else self._from_yaml(cfg)
+        self._from_detection_model(model, nc, cutoff) if model is not None else self._from_yaml(cfg, nc)
 
     def _from_detection_model(self, model, nc=1000, cutoff=10):
         # Create a YOLO classification model from a YOLO detection model
@@ -705,21 +705,44 @@ class ClassificationModel(BaseModel):
         self.save = []
         self.nc = nc
 
-    def _from_yaml(self, cfg):
+    def _from_yaml(self, cfg, nc, ch=3):
         # Create a YOLO classification model from a *.yaml file
-        self.model = None
+        if isinstance(cfg, dict):
+            self.yaml = cfg  # model dict
+        else:  # is *.yaml
+            import yaml  # for torch hub
+            self.yaml_file = Path(cfg).name
+            with open(cfg, encoding='ascii', errors='ignore') as f:
+                self.yaml = yaml.safe_load(f)  # model dict
+            
+            # Define model
+            ch = self.yaml['ch'] = self.yaml.get('ch', ch)  # input channels
+            if nc and nc != self.yaml['nc']:
+                LOGGER.info(f"Overriding model.yaml nc={self.yaml['nc']} with nc={nc}")
+                self.yaml['nc'] = nc  # override yaml value
+            
+            self.model, self.save = parse_model(deepcopy(self.yaml), ch=[ch])  # model, savelist
+            self.names = [str(i) for i in range(self.yaml['nc'])]  # default names
+            self.stride = torch.Tensor([1])  # no stride constraints
+            self.save = []
+            self.nc = nc
 
 
 def parse_model(d, ch):  # model_dict, input_channels(3)
     # Parse a YOLO model.yaml dictionary
     LOGGER.info(f"\n{'':>3}{'from':>18}{'n':>3}{'params':>10}  {'module':<40}{'arguments':<30}")
-    anchors, nc, gd, gw, act = d['anchors'], d['nc'], d['depth_multiple'], d['width_multiple'], d.get('activation')
+    nc, act, anchors = (d.get(x) for x in ("nc", "activation", "anchors"))
+    gd, gw = (d.get(x, 1.0) for x in ("depth_multiple", "width_multiple",))
+
     if act:
         Conv.default_act = eval(act)  # redefine default activation, i.e. Conv.default_act = nn.SiLU()
         RepConvN.default_act = eval(act)  # redefine default activation, i.e. Conv.default_act = nn.SiLU()
         LOGGER.info(f"{colorstr('activation:')} {act}")  # print
     na = (len(anchors[0]) // 2) if isinstance(anchors, list) else anchors  # number of anchors
-    no = na * (nc + 5)  # number of outputs = anchors * (classes + 5)
+    if na is None:
+        no = nc # Classify() output 
+    else:
+        no = na * (nc + 5)  # number of outputs = anchors * (classes + 5)
 
     layers, save, c2 = [], [], ch[-1]  # layers, savelist, ch out
     for i, (f, n, m, args) in enumerate(d['backbone'] + d['head']):  # from, number, module, args
@@ -730,13 +753,12 @@ def parse_model(d, ch):  # model_dict, input_channels(3)
 
         n = n_ = max(round(n * gd), 1) if n > 1 else n  # depth gain
         if m in {
-            Conv, AConv, ConvTranspose, 
+            Classify, Conv, AConv, ConvTranspose, 
             Bottleneck, SPP, SPPF, DWConv, BottleneckCSP, nn.ConvTranspose2d, DWConvTranspose2d, SPPCSPC, ADown,
             ELAN1, RepNCSPELAN4, SPPELAN}:
             c1, c2 = ch[f], args[0]
             if c2 != no:  # if not output
                 c2 = make_divisible(c2 * gw, 8)
-
             args = [c1, c2, *args[1:]]
             if m in {BottleneckCSP, SPPCSPC}:
                 args.insert(2, n)  # number of repeats

@@ -22,7 +22,7 @@ if platform.system() != 'Windows':
     ROOT = Path(os.path.relpath(ROOT, Path.cwd()))  # relative
 
 from models.experimental import attempt_load, End2End
-from models.yolo import ClassificationModel, Detect, DDetect, DualDetect, DualDDetect, DetectionModel, SegmentationModel
+from models.yolo import ClassificationModel, DDetectPose, Detect, DDetect, DualDetect, DualDDetect, DetectionModel, SegmentationModel
 from utils.dataloaders import LoadImages
 from utils.general import (LOGGER, Profile, check_dataset, check_img_size, check_requirements, check_version,
                            check_yaml, colorstr, file_size, get_default_args, print_args, url2file, yaml_save)
@@ -138,58 +138,59 @@ def export_onnx(model, im, file, opset, dynamic, simplify, prefix=colorstr('ONNX
         except Exception as e:
             LOGGER.info(f'{prefix} simplifier failure: {e}')
     return f, model_onnx
-
+    
 
 @try_export
-def export_onnx_end2end(model, im, file, simplify, topk_all, iou_thres, conf_thres, max_wh, device, labels, prefix=colorstr('ONNX END2END:')):
+def export_onnx_end2end(model, im, file, simplify, topk_all, iou_thres, conf_thres, max_wh, device, labels, kpt_label, dynamic, prefix=colorstr('ONNX END2END:')):
     # YOLO ONNX export
     check_requirements('onnx')
     import onnx
     LOGGER.info(f'\n{prefix} starting export with onnx {onnx.__version__}...')
     f = os.path.splitext(file)[0] + "-end2end.onnx"
-    batch_size = 'batch'
 
-    dynamic_axes = {'images': {0 : 'batch', 2: 'height', 3:'width'}, } # variable length axes
+    model = End2End(model, topk_all, iou_thres, conf_thres, max_wh, device, labels, kpt_label)
 
+    # Setup output names and shapes
     if max_wh is None:
-      output_axes = {
-                      'num_dets': {0: 'batch'},
-                      'det_boxes': {0: 'batch'},
-                      'det_scores': {0: 'batch'},
-                      'det_classes': {0: 'batch'},
-                  }
+        output_names = ['num_dets', 'det_boxes', 'det_scores', 'det_classes']
     else:
-      output_axes = {
-        'output': {0: 'batch'},
-      }
-    dynamic_axes.update(output_axes)
-    print('\nStarting export end2end onnx model for %s...' % 'TensorRT' if max_wh is None else 'onnxruntime')
-    model = End2End(model, topk_all, iou_thres, conf_thres, max_wh ,device, labels)
-    if max_wh is None:
-      output_names = ['num_dets', 'det_boxes', 'det_scores', 'det_classes']
-      shapes = [ batch_size, 1,  batch_size,  topk_all, 4,
-               batch_size,  topk_all,  batch_size,  topk_all]
-    else:
-      output_names = ['output']
+        output_names = ['output']
 
-    torch.onnx.export(model,
-                          im,
-                          f,
-                          verbose=False,
+    if dynamic:
+        batch = 'batch'
+        dynamic_axes = {'images': {0: 'batch', 2: 'height', 3: 'width'}}
+        if max_wh is None:
+            dynamic_axes.update({
+                'num_dets': {0: 'batch'},
+                'det_boxes': {0: 'batch'},
+                'det_scores': {0: 'batch'},
+                'det_classes': {0: 'batch'},
+            })
+        else:
+            dynamic_axes.update({
+                'output': {0: 'batch'},
+            })
+    else:
+        dynamic_axes = None
+        batch = 1  # assume single-batch inference
+
+    torch.onnx.export(model, 
+                          im, 
+                          f, 
+                          verbose=False, 
                           export_params=True,       # store the trained parameter weights inside the model file
-                          opset_version=12,
+                          opset_version=17, 
                           do_constant_folding=True, # whether to execute constant folding for optimization
                           input_names=['images'],
                           output_names=output_names,
-                          dynamic_axes=dynamic_axes)
+                          dynamic_axes=dynamic_axes if dynamic else None)
 
     # Checks
     model_onnx = onnx.load(f)  # load onnx model
     onnx.checker.check_model(model_onnx)  # check onnx model
-    if max_wh is None:
-      for i in model_onnx.graph.output:
-          for j in i.type.tensor_type.shape.dim:
-              j.dim_param = str(shapes.pop(0))
+    # for i in model_onnx.graph.output:
+    #     for j in i.type.tensor_type.shape.dim:
+    #         j.dim_param = str(shapes.pop(0))
 
     if simplify:
         try:
@@ -337,7 +338,8 @@ def export_saved_model(model,
                        iou_thres=0.45,
                        conf_thres=0.25,
                        keras=False,
-                       prefix=colorstr('TensorFlow SavedModel:')):
+                       prefix=colorstr('TensorFlow SavedModel:'),
+                       kpt_label=0):
     # YOLO TensorFlow SavedModel export
     try:
         import tensorflow as tf
@@ -531,12 +533,13 @@ def run(
         verbose=False,  # TensorRT: verbose log
         workspace=4,  # TensorRT: workspace size (GB)
         nms=False,  # TF: add NMS to model
-        max_wh=None, # ONNX | TensorRT: export
         agnostic_nms=False,  # TF: add agnostic NMS to model
         topk_per_class=100,  # TF.js NMS: topk per class to keep
         topk_all=100,  # TF.js NMS: topk for all classes to keep
         iou_thres=0.45,  # TF.js NMS: IoU threshold
-        conf_thres=0.25,  # TF.js NMS: confidence threshold
+        conf_thres=0.25,  # TF.js NMS: confidence threshold,
+        kpt_label=0,
+        max_wh=None,
 ):
     t = time.time()
     include = [x.lower() for x in include]  # to lowercase
@@ -566,13 +569,14 @@ def run(
     # Update model
     model.eval()
     for k, m in model.named_modules():
-        if isinstance(m, (Detect, DDetect, DualDetect, DualDDetect)):
+        if isinstance(m, (Detect, DDetect, DualDetect, DualDDetect, DDetectPose)):
             m.inplace = inplace
             m.dynamic = dynamic
             m.export = True
 
     for _ in range(2):
         y = model(im)  # dry runs
+
     if half and not coreml:
         im, model = im.half(), model.half()  # to FP16
     shape = tuple((y[0] if isinstance(y, (tuple, list)) else y).shape)  # model output shape
@@ -587,11 +591,11 @@ def run(
     if engine:  # TensorRT required before ONNX
         f[1], _ = export_engine(model, im, file, half, dynamic, simplify, workspace, verbose)
     if onnx or xml:  # OpenVINO requires ONNX
-        f[2], _ = export_onnx(model, im, file, opset, dynamic, simplify)
+        f[2], _ = export_onnx(model, im, file, opset, dynamic, simplify, kpt_label)
     if onnx_end2end:
         if isinstance(model, DetectionModel):
             labels = model.names
-            f[2], _ = export_onnx_end2end(model, im, file, simplify, topk_all, iou_thres, conf_thres, max_wh, device, len(labels))
+            f[2], model_onnx = export_onnx_end2end(model, im, file, simplify, topk_all, iou_thres, conf_thres, max_wh, device, len(labels), kpt_label, dynamic)
         else:
             raise RuntimeError("The model is not a DetectionModel.")
     if xml:  # OpenVINO
@@ -669,7 +673,15 @@ def parse_opt():
     parser.add_argument('--topk-all', type=int, default=100, help='ONNX END2END/TF.js NMS: topk for all classes to keep')
     parser.add_argument('--iou-thres', type=float, default=0.45, help='ONNX END2END/TF.js NMS: IoU threshold')
     parser.add_argument('--conf-thres', type=float, default=0.25, help='ONNX END2END/TF.js NMS: confidence threshold')
-    parser.add_argument('--max-wh', type=int, default=None, help='None for tensorrt nms, int value for onnx-runtime nms')
+    parser.add_argument(
+        "--kpt-label", type=int, default=0, help="number of keypoints detection"
+    )
+    parser.add_argument(
+        "--max-wh",
+        type=int,
+        default=None,
+        help="None for tensorrt nms, int value for onnx-runtime nms",
+    )
     parser.add_argument(
         '--include',
         nargs='+',
@@ -677,9 +689,9 @@ def parse_opt():
         help='torchscript, onnx, onnx_end2end, openvino, engine, coreml, saved_model, pb, tflite, edgetpu, tfjs, paddle')
     opt = parser.parse_args()
 
-    if 'onnx_end2end' in opt.include:
+    if 'onnx_end2end' in opt.include:  
         opt.simplify = True
-        opt.dynamic = True
+        # opt.dynamic = True
         opt.inplace = True
         opt.half = False
 

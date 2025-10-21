@@ -26,6 +26,106 @@ except ImportError:
     thop = None
 
 
+
+class DDetectPose(nn.Module):
+    # YOLO Detect head for detection models
+    dynamic = False  # force grid reconstruction
+    export = False  # export mode
+    shape = None
+    anchors = torch.empty(0)  # init
+    strides = torch.empty(0)  # init
+
+    def __init__(self, nc=80, kpt_label=(), ch=(), inplace=True):  # detection layer
+        """
+        Initialize YOLOv9 network with detection and pose estimation capabilities.
+
+        Args:
+            nc (int): Number of classes.
+            kpt_label (int): Number of keypoints, number of dims (for x,y,visible).
+            ch (tuple): Tuple of channel sizes from backbone feature maps.
+            inplace (bool): Use inplace operations (e.g., slice assignment).
+        """
+        super().__init__()
+        self.nc = nc  # number of classes
+        self.nl = len(ch)  # number of detection layers
+        self.reg_max = 16
+        self.no = nc + self.reg_max * 4  # number of outputs per anchor
+        self.inplace = inplace  # use inplace ops (e.g. slice assignment)
+        self.stride = torch.zeros(self.nl)  # strides computed during build
+        self.nk = kpt_label * 3  # x y v
+
+        c2, c3 = make_divisible(max((ch[0] // 4, self.reg_max * 4, 16)), 4), max((ch[0], min((self.nc * 2, 128))))  # channels
+        self.cv2 = nn.ModuleList(
+            nn.Sequential(Conv(x, c2, 3), Conv(c2, c2, 3, g=4), nn.Conv2d(c2, 4 * self.reg_max, 1, groups=4)) for x in ch)
+        self.cv3 = nn.ModuleList(
+            nn.Sequential(Conv(x, c3, 3), Conv(c3, c3, 3), nn.Conv2d(c3, self.nc, 1)) for x in ch)
+        self.dfl = DFL(self.reg_max) if self.reg_max > 1 else nn.Identity()
+
+        # Keypoint layers
+        c4 = max(ch[0] // 4, self.nk)
+        self.cv4 = nn.ModuleList(nn.Sequential(Conv(x, c4, 3), Conv(c4, c4, 3), nn.Conv2d(c4, self.nk, 1)) for x in ch)
+
+    def forward(self, x):
+        """
+        Perform forward pass through YOLOv9 model and return detection and keypoint predictions.
+
+        Args:
+            x (list[torch.Tensor]): Input feature maps from backbone.
+
+        Returns:
+            If training: (detection outputs, keypoint outputs)
+            If inference: (combined detection and keypoint outputs, (detection outputs, keypoint outputs)) or combined tensor
+        """
+        bs = x[0].shape[0]  # batch size
+        shape = x[0].shape  # BCHW
+        
+        x_orig = [xi.clone() for xi in x]
+        for i in range(self.nl):
+            x[i] = torch.cat((self.cv2[i](x[i]), self.cv3[i](x[i])), 1)
+        
+        kpt = torch.cat([self.cv4[i](x_orig[i]).view(bs, self.nk, -1) for i in range(self.nl)], -1)  # (bs, nk, h*w)
+        
+        if self.training:
+            return x, kpt
+        elif self.dynamic or self.export or self.shape != shape:
+            self.anchors, self.strides = (x.transpose(0, 1) for x in make_anchors(x, self.stride, 0.5))
+            self.shape = shape
+
+        box, cls = torch.cat([xi.view(shape[0], self.no, -1) for xi in x], 2).split((self.reg_max * 4, self.nc), 1)
+        dbox = dist2bbox(self.dfl(box), self.anchors.unsqueeze(0), xywh=True, dim=1) * self.strides
+        det = torch.cat((dbox, cls.sigmoid()), 1)
+        pred_kpt = self.kpts_decode(bs, kpt)
+
+        return torch.cat([det, pred_kpt], 1) if self.export else (torch.cat([det, pred_kpt], 1), (x, kpt))
+
+    def kpts_decode(self, bs, kpts, ndim = 3):
+        """
+        Decode keypoints from predictions.
+
+        Args:
+            bs (int): Batch size.
+            kpts (torch.Tensor): Keypoint predictions.
+
+        Returns:
+            torch.Tensor: Decoded keypoints.
+        """
+        y = kpts.clone()
+        if ndim == 3:
+            y[:, 2::ndim] = y[:, 2::ndim].sigmoid()  # Apply sigmoid to visibility scores
+        y[:, 0::ndim] = (y[:, 0::ndim] * 2.0 + (self.anchors[0] - 0.5)) * self.strides  # x coordinates
+        y[:, 1::ndim] = (y[:, 1::ndim] * 2.0 + (self.anchors[1] - 0.5)) * self.strides  # y coordinates
+        return y
+
+    def bias_init(self):
+        # Initialize Detect() biases, WARNING: requires stride availability
+        m = self  # self.model[-1]  # Detect() module
+        # cf = torch.bincount(torch.tensor(np.concatenate(dataset.labels, 0)[:, 0]).long(), minlength=nc) + 1
+        # ncf = math.log(0.6 / (m.nc - 0.999999)) if cf is None else torch.log(cf / cf.sum())  # nominal class frequency
+        for a, b, s in zip(m.cv2, m.cv3, m.stride):  # from
+            a[-1].bias.data[:] = 1.0  # box
+            b[-1].bias.data[:m.nc] = math.log(5 / m.nc / (640 / s) ** 2)  # cls (5 objects and 80 classes per 640 image)
+
+
 class Detect(nn.Module):
     # YOLO Detect head for detection models
     dynamic = False  # force grid reconstruction

@@ -1,0 +1,10 @@
+python train.py \
+    --weights 'weights/gelan-c.pt' \
+    --cfg 'models/detect/gelan-keypoint.yaml' \
+    --data 'datahub/face_gender/data.yaml' \
+    --hyp 'data/hyps/hyp.scratch-high.yaml' \
+    --batch-size 8 \
+    --name "gelan-keypoint-ddtect" \
+    --kpt-label 5 \
+    --epochs 250 \
+    --optimizer 'AdamW' \

@@ -84,7 +84,6 @@ class ORT_NMS(torch.autograd.Function):
         zeros = torch.zeros((num_det,), dtype=torch.int64).to(device)
         selected_indices = torch.cat([batches[None], zeros[None], idxs[None]], 0).T.contiguous()
         selected_indices = selected_indices.to(torch.int64)
-
         return selected_indices
 
     @staticmethod
@@ -143,7 +142,7 @@ class TRT_NMS(torch.autograd.Function):
 
 class ONNX_ORT(nn.Module):
     '''onnx module with ONNX-Runtime NMS operation.'''
-    def __init__(self, max_obj=100, iou_thres=0.45, score_thres=0.25, max_wh=640, device=None, n_classes=80):
+    def __init__(self, max_obj=100, iou_thres=0.45, score_thres=0.25, max_wh=640, device=None, n_classes=80, label_kpt=0):
         super().__init__()
         self.device = device if device else torch.device("cpu")
         self.max_obj = torch.tensor([max_obj]).to(device)
@@ -154,24 +153,25 @@ class ONNX_ORT(nn.Module):
                                            dtype=torch.float32,
                                            device=self.device)
         self.n_classes=n_classes
+        self.label_kpt = label_kpt
 
     def forward(self, x):
-        ## https://github.com/thaitc-hust/yolov9-tensorrt/blob/main/torch2onnx.py
-        ## thanks https://github.com/thaitc-hust
-        if isinstance(x, list):  ## yolov9-c.pt and yolov9-e.pt return list
+        if isinstance(x, list):  
             x = x[1]
         x = x.permute(0, 2, 1)
+
+        # === bbox decode ===
         bboxes_x = x[..., 0:1]
         bboxes_y = x[..., 1:2]
         bboxes_w = x[..., 2:3]
         bboxes_h = x[..., 3:4]
-        bboxes = torch.cat([bboxes_x, bboxes_y, bboxes_w, bboxes_h], dim = -1)
-        # bboxes = bboxes.unsqueeze(2) # [n_batch, n_bboxes, 4] -> [n_batch, n_bboxes, 1, 4]
-        obj_conf = x[..., 4:]
-        scores = obj_conf
-
+        bboxes = torch.cat([bboxes_x, bboxes_y, bboxes_w, bboxes_h], dim=-1)
         bboxes @= self.convert_matrix
-        max_score, category_id = scores.max(2, keepdim=True)
+
+        # === class scores ===
+        cls_scores = x[..., 4 : 4 + self.n_classes]
+        max_score, category_id = cls_scores.max(2, keepdim=True)
+
         dis = category_id.float() * self.max_wh
         nmsbox = bboxes + dis
         max_score_tp = max_score.transpose(1, 2).contiguous()
@@ -180,14 +180,21 @@ class ONNX_ORT(nn.Module):
         selected_boxes = bboxes[X, Y, :]
         selected_categories = category_id[X, Y, :].float()
         selected_scores = max_score[X, Y, :]
+       
+        if self.label_kpt:
+            lmks = x[..., 4 + self.n_classes:]
+            selected_lmks = lmks[X, Y, :]
+
         X = X.unsqueeze(1).float()
 
+        if self.label_kpt:
+            return torch.cat([X, selected_boxes, selected_categories, selected_scores, selected_lmks], 1)
+        
         return torch.cat([X, selected_boxes, selected_categories, selected_scores], 1)
-
 
 class ONNX_TRT(nn.Module):
     '''onnx module with TensorRT NMS operation.'''
-    def __init__(self, max_obj=100, iou_thres=0.45, score_thres=0.25, max_wh=None ,device=None, n_classes=80):
+    def __init__(self, max_obj=100, iou_thres=0.45, score_thres=0.25, max_wh=None, device=None, n_classes=80, label_kpt=0):
         super().__init__()
         assert max_wh is None
         self.device = device if device else torch.device('cpu')
@@ -199,6 +206,7 @@ class ONNX_TRT(nn.Module):
         self.score_activation = 0
         self.score_threshold = score_thres
         self.n_classes=n_classes
+        self.label_kpt = label_kpt
 
     def forward(self, x):
         ## https://github.com/thaitc-hust/yolov9-tensorrt/blob/main/torch2onnx.py
@@ -222,14 +230,14 @@ class ONNX_TRT(nn.Module):
 
 class End2End(nn.Module):
     '''export onnx or tensorrt model with NMS operation.'''
-    def __init__(self, model, max_obj=100, iou_thres=0.45, score_thres=0.25, max_wh=None, device=None, n_classes=80):
+    def __init__(self, model, max_obj=100, iou_thres=0.45, score_thres=0.25, max_wh=None, device=None, n_classes=80, label_kpt=0):
         super().__init__()
         device = device if device else torch.device('cpu')
         assert isinstance(max_wh,(int)) or max_wh is None
         self.model = model.to(device)
         self.model.model[-1].end2end = True
         self.patch_model = ONNX_TRT if max_wh is None else ONNX_ORT
-        self.end2end = self.patch_model(max_obj, iou_thres, score_thres, max_wh, device, n_classes)
+        self.end2end = self.patch_model(max_obj, iou_thres, score_thres, max_wh, device, n_classes, label_kpt)
         self.end2end.eval()
 
     def forward(self, x):
@@ -244,7 +252,7 @@ def attempt_load(weights, device=None, inplace=True, fuse=True):
 
     model = Ensemble()
     for w in weights if isinstance(weights, list) else [weights]:
-        ckpt = torch.load(attempt_download(w), map_location='cpu')  # load
+        ckpt = torch.load(attempt_download(w), map_location='cpu', weights_only=False)  # load
         ckpt = (ckpt.get('ema') or ckpt['model']).to(device).float()  # FP32 model
 
         # Model compatibility updates

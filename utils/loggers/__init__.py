@@ -1,4 +1,5 @@
 import os
+from re import A
 import warnings
 from pathlib import Path
 
@@ -51,7 +52,7 @@ except (ModuleNotFoundError, ImportError, AssertionError):
 
 class Loggers():
     # YOLO Loggers class
-    def __init__(self, save_dir=None, weights=None, opt=None, hyp=None, logger=None, include=LOGGERS):
+    def __init__(self, save_dir=None, weights=None, opt=None, hyp=None, logger=None, include=LOGGERS, kpt_label=False):
         self.save_dir = save_dir
         self.weights = weights
         self.opt = opt
@@ -59,20 +60,40 @@ class Loggers():
         self.plots = not opt.noplots  # plot results
         self.logger = logger  # for printing results to console
         self.include = include
-        self.keys = [
+        if kpt_label:
+            self.keys = [
             'train/box_loss',
             'train/cls_loss',
-            'train/dfl_loss',  # train loss
+            'train/dfl_loss',  
+            'train/kpt_loss',
+            'train/kptv_loss', # train loss
             'metrics/precision',
             'metrics/recall',
             'metrics/mAP_0.5',
             'metrics/mAP_0.5:0.95',  # metrics
             'val/box_loss',
             'val/cls_loss',
-            'val/dfl_loss',  # val loss
+            'val/dfl_loss',  
+            'val/kpt_loss',
+            'val/kptv_loss', # val loss
             'x/lr0',
             'x/lr1',
             'x/lr2']  # params
+        else:
+            self.keys = [
+                'train/box_loss',
+                'train/cls_loss',
+                'train/dfl_loss',  # train loss
+                'metrics/precision',
+                'metrics/recall',
+                'metrics/mAP_0.5',
+                'metrics/mAP_0.5:0.95',  # metrics
+                'val/box_loss',
+                'val/cls_loss',
+                'val/dfl_loss',  # val loss
+                'x/lr0',
+                'x/lr1',
+                'x/lr2']  # params
         self.best_keys = ['best/epoch', 'best/precision', 'best/recall', 'best/mAP_0.5', 'best/mAP_0.5:0.95']
         for k in LOGGERS:
             setattr(self, k, None)  # init empty logger dictionary
@@ -219,6 +240,7 @@ class Loggers():
 
     def on_fit_epoch_end(self, vals, epoch, best_fitness, fi):
         # Callback runs at the end of each fit (train+val) epoch
+        vals = [v.item() if isinstance(v, torch.Tensor) else v for v in vals]
         x = dict(zip(self.keys, vals))
         if self.csv:
             file = self.save_dir / 'results.csv'
